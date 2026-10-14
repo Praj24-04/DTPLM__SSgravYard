@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -8,7 +8,7 @@ import {
   ActivityIndicator,
   ScrollView,
   TouchableOpacity,
-  Animated,
+  FlatList,
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { useRouter } from 'expo-router';
@@ -18,55 +18,82 @@ import { analyzeScreenshot, AIResult } from '../ai';
 import { saveEntry } from '../storage';
 import { ApiKeyModal } from '../components/ApiKeyModal';
 
+// ─── Types ─────────────────────────────────────────────────────────────────────
+
+type ItemStatus = 'pending' | 'analyzing' | 'done' | 'error';
+
+interface BulkItem {
+  id: string;
+  uri: string;
+  status: ItemStatus;
+  result?: AIResult;
+  errorMsg?: string;
+}
+
+// ─── Constants ──────────────────────────────────────────────────────────────────
+
+const CONCURRENCY = 3; // max parallel Gemini API calls
+
+// ─── Component ──────────────────────────────────────────────────────────────────
+
 export default function Upload() {
   const router = useRouter();
-  const [imageUri, setImageUri] = useState<string | null>(null);
-  const [analyzing, setAnalyzing] = useState(false);
-  const [aiResult, setAiResult] = useState<AIResult | null>(null);
-  const [savedEntryId, setSavedEntryId] = useState<string | null>(null);
-  const [isSaved, setIsSaved] = useState(false);
-  const [showCategoryPicker, setShowCategoryPicker] = useState(false);
-  const [currentCategory, setCurrentCategory] = useState<string>('ideas');
+  const [items, setItems] = useState<BulkItem[]>([]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [allDone, setAllDone] = useState(false);
   const [apiKeyModalVisible, setApiKeyModalVisible] = useState(false);
+  const processingRef = useRef(false);
 
-  const pickImage = async () => {
+  // ── Helpers ──────────────────────────────────────────────────────────────────
+
+  const updateItem = useCallback((id: string, patch: Partial<BulkItem>) => {
+    setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
+  }, []);
+
+  const getCategoryIcon = (catId: string) => {
+    const found = categories.find((c) => c.id === catId);
+    return found ? found.icon : 'folder-outline';
+  };
+
+  // ── Pick images ──────────────────────────────────────────────────────────────
+
+  const pickImages = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
-      alert('Gallery access is needed to select a screenshot.');
+      alert('Gallery access is needed to select screenshots.');
       return;
     }
 
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ['images'],
+      allowsMultipleSelection: true,
       quality: 0.6,
       base64: false,
+      selectionLimit: 50,
     });
 
     if (!result.canceled && result.assets && result.assets.length > 0) {
-      const asset = result.assets[0];
-      setImageUri(asset.uri);
-      setAiResult(null);
-      setIsSaved(false);
-      setShowCategoryPicker(false);
-
-      // Immediately run AI understanding & auto-categorization
-      processImageWithAI(asset.uri, asset.base64 ?? undefined);
+      const newItems: BulkItem[] = result.assets.map((asset, i) => ({
+        id: `${Date.now()}-${i}`,
+        uri: asset.uri,
+        status: 'pending' as ItemStatus,
+      }));
+      setItems(newItems);
+      setAllDone(false);
+      startBatchProcessing(newItems);
     }
   };
 
-  const processImageWithAI = async (uri: string, base64Data?: string) => {
-    setAnalyzing(true);
-    try {
-      // 1. AI analyzes the screenshot
-      const result = await analyzeScreenshot(uri, base64Data);
-      setAiResult(result);
-      setCurrentCategory(result.category);
+  // ── Batch processing engine ───────────────────────────────────────────────────
 
-      // 2. AUTOMATICALLY save immediately - NO manual human selection required!
-      const entryId = Date.now().toString();
+  const processOne = async (item: BulkItem) => {
+    updateItem(item.id, { status: 'analyzing' });
+    try {
+      const result = await analyzeScreenshot(item.uri);
+
       await saveEntry({
-        id: entryId,
-        imageUri: uri,
+        id: item.id,
+        imageUri: item.uri,
         category: result.category,
         categoryLabel: result.categoryLabel,
         intent: result.intent,
@@ -76,54 +103,201 @@ export default function Upload() {
         confirmedByUser: true,
       });
 
-      setSavedEntryId(entryId);
-      setIsSaved(true);
+      updateItem(item.id, { status: 'done', result });
     } catch (err) {
-      console.warn('Analysis error:', err);
-    } finally {
-      setAnalyzing(false);
-    }
-  };
-
-  const handleManualCategoryChange = async (catId: string) => {
-    setCurrentCategory(catId);
-    const catLabel = categories.find((c) => c.id === catId)?.label ?? 'Ideas & Notes';
-    if (imageUri && savedEntryId) {
-      await saveEntry({
-        id: savedEntryId,
-        imageUri,
-        category: catId,
-        categoryLabel: catLabel,
-        intent: aiResult?.intent ?? 'Saved screenshot',
-        summary: aiResult?.summary ?? '',
-        tags: aiResult?.tags ?? [],
-        createdAt: Date.now(),
-        confirmedByUser: true,
+      updateItem(item.id, {
+        status: 'error',
+        errorMsg: err instanceof Error ? err.message : 'Unknown error',
       });
-      if (aiResult) {
-        setAiResult({ ...aiResult, category: catId, categoryLabel: catLabel });
-      }
     }
   };
 
-  const resetForm = () => {
-    setImageUri(null);
-    setAiResult(null);
-    setIsSaved(false);
-    setShowCategoryPicker(false);
+  const startBatchProcessing = async (initialItems: BulkItem[]) => {
+    if (processingRef.current) return;
+    processingRef.current = true;
+    setIsProcessing(true);
+
+    const queue = [...initialItems];
+    const runNext = async (): Promise<void> => {
+      const item = queue.shift();
+      if (!item) return;
+      await processOne(item);
+      await runNext();
+    };
+
+    const slots = Array.from(
+      { length: Math.min(CONCURRENCY, initialItems.length) },
+      () => runNext()
+    );
+    await Promise.all(slots);
+
+    processingRef.current = false;
+    setIsProcessing(false);
+    setAllDone(true);
   };
 
-  const getCategoryIcon = (catId: string) => {
-    const found = categories.find((c) => c.id === catId);
-    return found ? found.icon : 'folder-outline';
-  };
+  // ── Derived stats ────────────────────────────────────────────────────────────
+
+  const total = items.length;
+  const doneCount = items.filter((it) => it.status === 'done').length;
+  const errorCount = items.filter((it) => it.status === 'error').length;
+  const pendingCount = items.filter(
+    (it) => it.status === 'pending' || it.status === 'analyzing'
+  ).length;
+
+  const categorySummary = items
+    .filter((it) => it.status === 'done' && it.result)
+    .reduce<Record<string, { label: string; icon: string; count: number }>>(
+      (acc, it) => {
+        const cat = it.result!;
+        if (!acc[cat.category]) {
+          acc[cat.category] = {
+            label: cat.categoryLabel,
+            icon: getCategoryIcon(cat.category),
+            count: 0,
+          };
+        }
+        acc[cat.category].count++;
+        return acc;
+      },
+      {}
+    );
+
+  // ── Render item ───────────────────────────────────────────────────────────────
+
+  const renderItem = ({ item }: { item: BulkItem }) => (
+    <View style={styles.itemRow}>
+      <Image source={{ uri: item.uri }} style={styles.itemThumb} />
+      <View style={styles.itemInfo}>
+        {item.status === 'pending' && (
+          <Text style={styles.itemStatusPending}>Waiting…</Text>
+        )}
+        {item.status === 'analyzing' && (
+          <View style={styles.itemAnalyzingRow}>
+            <ActivityIndicator size="small" color={colors.primary} />
+            <Text style={styles.itemStatusAnalyzing}>AI analyzing…</Text>
+          </View>
+        )}
+        {item.status === 'done' && item.result && (
+          <>
+            <View style={styles.itemCatPill}>
+              <Ionicons
+                name={getCategoryIcon(item.result.category) as any}
+                size={12}
+                color={colors.primaryDark}
+              />
+              <Text style={styles.itemCatText}>{item.result.categoryLabel}</Text>
+            </View>
+            <Text style={styles.itemIntent} numberOfLines={2}>
+              {item.result.intent}
+            </Text>
+            {item.result.isRealAi && (
+              <View style={styles.geminiChip}>
+                <Ionicons name="sparkles" size={10} color={colors.primary} />
+                <Text style={styles.geminiChipText}>Gemini</Text>
+              </View>
+            )}
+          </>
+        )}
+        {item.status === 'error' && (
+          <View style={styles.itemErrorRow}>
+            <Ionicons name="alert-circle-outline" size={14} color={colors.error} />
+            <Text style={styles.itemErrorText}>Failed — will retry next import</Text>
+          </View>
+        )}
+      </View>
+      <View style={styles.itemStatusIcon}>
+        {item.status === 'done' && (
+          <Ionicons name="checkmark-circle" size={22} color={colors.primary} />
+        )}
+        {item.status === 'error' && (
+          <Ionicons name="close-circle" size={22} color={colors.error} />
+        )}
+        {item.status === 'analyzing' && (
+          <ActivityIndicator size="small" color={colors.primary} />
+        )}
+        {item.status === 'pending' && (
+          <Ionicons name="time-outline" size={20} color={colors.textMuted} />
+        )}
+      </View>
+    </View>
+  );
+
+  // ── Empty / picker state ──────────────────────────────────────────────────────
+
+  if (items.length === 0) {
+    return (
+      <ScrollView style={styles.scroll} contentContainerStyle={styles.container}>
+        <View style={styles.header}>
+          <View style={styles.headerTop}>
+            <Text style={styles.headerTitle}>Bulk Import</Text>
+            <TouchableOpacity
+              style={styles.keyBtn}
+              onPress={() => setApiKeyModalVisible(true)}
+            >
+              <Ionicons name="key-outline" size={16} color={colors.primaryDark} />
+              <Text style={styles.keyBtnText}>API Key</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={styles.headerSub}>
+            Select multiple screenshots at once. AI categorizes all of them automatically.
+          </Text>
+        </View>
+
+        <Pressable style={styles.dropZone} onPress={pickImages}>
+          <View style={styles.uploadIconCircle}>
+            <Ionicons name="images-outline" size={36} color={colors.primary} />
+          </View>
+          <Text style={styles.dropTitle}>Select Screenshots</Text>
+          <Text style={styles.dropSub}>{"Choose any number \u2014 we'll sort them all"}</Text>
+          <View style={styles.selectBtn}>
+            <Ionicons name="add" size={18} color="#FFFFFF" />
+            <Text style={styles.selectBtnText}>Open Gallery</Text>
+          </View>
+        </Pressable>
+
+        <View style={styles.hints}>
+          {(
+            [
+              {
+                icon: 'checkmark-done-outline',
+                text: 'Select up to 50 screenshots at once',
+              },
+              { icon: 'flash-outline', text: 'Up to 3 processed simultaneously' },
+              {
+                icon: 'folder-open-outline',
+                text: 'Each auto-filed into the right category',
+              },
+            ] as { icon: string; text: string }[]
+          ).map((h, i) => (
+            <View key={i} style={styles.hintRow}>
+              <View style={styles.hintIconBox}>
+                <Ionicons name={h.icon as any} size={16} color={colors.primary} />
+              </View>
+              <Text style={styles.hintText}>{h.text}</Text>
+            </View>
+          ))}
+        </View>
+
+        <ApiKeyModal
+          visible={apiKeyModalVisible}
+          onClose={() => setApiKeyModalVisible(false)}
+          onKeySaved={() => {}}
+        />
+      </ScrollView>
+    );
+  }
+
+  // ── Processing / done state ───────────────────────────────────────────────────
 
   return (
-    <ScrollView style={styles.scroll} contentContainerStyle={styles.container}>
-      {/* Header */}
-      <View style={styles.header}>
+    <View style={styles.fill}>
+      {/* Sticky Header */}
+      <View style={styles.stickyHeader}>
         <View style={styles.headerTop}>
-          <Text style={styles.headerTitle}>Add Screenshot</Text>
+          <Text style={styles.headerTitle}>
+            {allDone ? 'Import Complete' : 'Processing…'}
+          </Text>
           <TouchableOpacity
             style={styles.keyBtn}
             onPress={() => setApiKeyModalVisible(true)}
@@ -132,208 +306,117 @@ export default function Upload() {
             <Text style={styles.keyBtnText}>API Key</Text>
           </TouchableOpacity>
         </View>
-        <Text style={styles.headerSub}>
-          Select any screenshot. AI will automatically understand, categorize, and save it.
-        </Text>
-      </View>
 
-      {!imageUri ? (
-        /* Empty / Picker State */
-        <Pressable style={styles.dropZone} onPress={pickImage}>
-          <View style={styles.uploadIconCircle}>
-            <Ionicons name="cloud-upload-outline" size={36} color={colors.primary} />
+        <View style={styles.progressBarTrack}>
+          <View
+            style={[
+              styles.progressBarFill,
+              {
+                width: `${
+                  total > 0 ? ((doneCount + errorCount) / total) * 100 : 0
+                }%`,
+              },
+            ]}
+          />
+        </View>
+
+        <View style={styles.statsRow}>
+          <View style={styles.statChip}>
+            <Ionicons name="checkmark-circle" size={13} color={colors.primary} />
+            <Text style={styles.statText}>{doneCount} done</Text>
           </View>
-          <Text style={styles.dropTitle}>Choose from Gallery</Text>
-          <Text style={styles.dropSub}>PNG, JPG, or WEBP screenshots</Text>
-          <View style={styles.selectBtn}>
-            <Ionicons name="image-outline" size={16} color="#FFFFFF" />
-            <Text style={styles.selectBtnText}>Select Screenshot</Text>
-          </View>
-        </Pressable>
-      ) : (
-        /* Image Preview & AI Status */
-        <View style={styles.activeContent}>
-          <View style={styles.previewCard}>
-            <Image source={{ uri: imageUri }} style={styles.previewImage} resizeMode="cover" />
-
-            {/* Analyzing Overlay */}
-            {analyzing && (
-              <View style={styles.analyzingOverlay}>
-                <View style={styles.analyzingBadge}>
-                  <ActivityIndicator size="small" color={colors.primary} />
-                  <Text style={styles.analyzingText}>AI is understanding image...</Text>
-                </View>
-              </View>
-            )}
-          </View>
-
-          {/* AI Result & Auto-Saved Confirmation */}
-          {isSaved && aiResult && (
-            <View style={styles.resultCard}>
-              {!aiResult.isRealAi && (
-                <TouchableOpacity
-                  style={styles.keyWarningBanner}
-                  onPress={() => setApiKeyModalVisible(true)}
-                >
-                  <Ionicons name="warning-outline" size={16} color={colors.warning} />
-                  <Text style={styles.keyWarningText}>
-                    Offline fallback used. Tap to connect Gemini API Key for accurate vision.
-                  </Text>
-                  <Ionicons name="chevron-forward" size={14} color={colors.warning} />
-                </TouchableOpacity>
-              )}
-
-              {/* Success Banner */}
-              <View style={styles.successBanner}>
-                <Ionicons name="checkmark-circle" size={18} color={colors.primary} />
-                <Text style={styles.successBannerText}>
-                  {aiResult.isRealAi ? 'Gemini AI Categorized & Saved' : 'Automatically Categorized & Saved'}
-                </Text>
-              </View>
-
-              {/* Categorization Pill */}
-              <View style={styles.detectedCategoryRow}>
-                <Text style={styles.sectionLabel}>DETECTED CATEGORY</Text>
-                <View style={styles.categoryPill}>
-                  <Ionicons
-                    name={getCategoryIcon(currentCategory)}
-                    size={16}
-                    color={colors.primaryDark}
-                  />
-                  <Text style={styles.categoryPillText}>{aiResult.categoryLabel}</Text>
-                </View>
-              </View>
-
-              {/* Detected Intent */}
-              <View style={styles.infoSection}>
-                <Text style={styles.sectionLabel}>DETECTED INTENT</Text>
-                <Text style={styles.intentText}>{aiResult.intent}</Text>
-              </View>
-
-              {/* Summary */}
-              {aiResult.summary ? (
-                <View style={styles.infoSection}>
-                  <Text style={styles.sectionLabel}>CONTENT SUMMARY</Text>
-                  <Text style={styles.summaryText}>{aiResult.summary}</Text>
-                </View>
-              ) : null}
-
-              {/* Tags */}
-              {aiResult.tags.length > 0 && (
-                <View style={styles.infoSection}>
-                  <Text style={styles.sectionLabel}>EXTRACTED TAGS</Text>
-                  <View style={styles.tagsContainer}>
-                    {aiResult.tags.map((tag, idx) => (
-                      <View key={idx} style={styles.tagBadge}>
-                        <Text style={styles.tagBadgeText}>#{tag}</Text>
-                      </View>
-                    ))}
-                  </View>
-                </View>
-              )}
-
-              {/* Optional Category Override Toggle */}
-              <TouchableOpacity
-                style={styles.changeCategoryToggle}
-                onPress={() => setShowCategoryPicker(!showCategoryPicker)}
-              >
-                <Ionicons
-                  name={showCategoryPicker ? 'chevron-up' : 'options-outline'}
-                  size={15}
-                  color={colors.textSecondary}
-                />
-                <Text style={styles.changeCategoryToggleText}>
-                  {showCategoryPicker ? 'Hide category options' : 'Change category (optional)'}
-                </Text>
-              </TouchableOpacity>
-
-              {showCategoryPicker && (
-                <View style={styles.categoryList}>
-                  {categories.map((cat) => (
-                    <TouchableOpacity
-                      key={cat.id}
-                      style={[
-                        styles.catOption,
-                        currentCategory === cat.id && styles.catOptionActive,
-                      ]}
-                      onPress={() => handleManualCategoryChange(cat.id)}
-                    >
-                      <Ionicons
-                        name={cat.icon}
-                        size={16}
-                        color={currentCategory === cat.id ? colors.primaryDark : colors.textSecondary}
-                      />
-                      <Text
-                        style={[
-                          styles.catOptionText,
-                          currentCategory === cat.id && styles.catOptionTextActive,
-                        ]}
-                      >
-                        {cat.label}
-                      </Text>
-                      {currentCategory === cat.id && (
-                        <Ionicons name="checkmark" size={16} color={colors.primaryDark} style={styles.checkIcon} />
-                      )}
-                    </TouchableOpacity>
-                  ))}
-                </View>
-              )}
-
-              {/* Navigation Action Buttons */}
-              <View style={styles.actionButtons}>
-                <TouchableOpacity
-                  style={styles.primaryActionBtn}
-                  onPress={() => router.replace('/')}
-                >
-                  <Ionicons name="home-outline" size={18} color="#FFFFFF" />
-                  <Text style={styles.primaryActionBtnText}>Go to Vault</Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  style={styles.secondaryActionBtn}
-                  onPress={resetForm}
-                >
-                  <Ionicons name="add" size={18} color={colors.primaryDark} />
-                  <Text style={styles.secondaryActionBtnText}>Add Another</Text>
-                </TouchableOpacity>
-              </View>
+          {errorCount > 0 && (
+            <View style={[styles.statChip, styles.statChipError]}>
+              <Ionicons name="close-circle" size={13} color={colors.error} />
+              <Text style={[styles.statText, { color: colors.error }]}>
+                {errorCount} failed
+              </Text>
             </View>
           )}
-
-          {/* Change Image Button while analyzing or before finish */}
-          {!isSaved && (
-            <TouchableOpacity style={styles.repickBtn} onPress={pickImage} disabled={analyzing}>
-              <Text style={styles.repickBtnText}>Select a different image</Text>
-            </TouchableOpacity>
+          {pendingCount > 0 && (
+            <View style={styles.statChip}>
+              <Ionicons name="time-outline" size={13} color={colors.textMuted} />
+              <Text style={[styles.statText, { color: colors.textMuted }]}>
+                {pendingCount} left
+              </Text>
+            </View>
           )}
+          <Text style={styles.statTotal}>{total} total</Text>
+        </View>
+      </View>
+
+      {/* Category summary when done */}
+      {allDone && Object.keys(categorySummary).length > 0 && (
+        <View style={styles.summarySection}>
+          <Text style={styles.summaryTitle}>Saved to Categories</Text>
+          <View style={styles.summaryGrid}>
+            {Object.entries(categorySummary).map(([catId, { label, icon, count }]) => (
+              <View key={catId} style={styles.summaryCard}>
+                <Ionicons name={icon as any} size={20} color={colors.primaryDark} />
+                <Text style={styles.summaryCount}>{count}</Text>
+                <Text style={styles.summaryLabel}>{label}</Text>
+              </View>
+            ))}
+          </View>
         </View>
       )}
+
+      {/* Item list */}
+      <FlatList
+        data={items}
+        renderItem={renderItem}
+        keyExtractor={(it) => it.id}
+        contentContainerStyle={styles.listContent}
+        showsVerticalScrollIndicator={false}
+        ListFooterComponent={
+          allDone ? (
+            <View style={styles.footer}>
+              <TouchableOpacity
+                style={styles.primaryActionBtn}
+                onPress={() => router.replace('/')}
+              >
+                <Ionicons name="home-outline" size={18} color="#FFFFFF" />
+                <Text style={styles.primaryActionBtnText}>Go to Vault</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.secondaryActionBtn}
+                onPress={() => {
+                  setItems([]);
+                  setAllDone(false);
+                }}
+              >
+                <Ionicons name="add" size={18} color={colors.primaryDark} />
+                <Text style={styles.secondaryActionBtnText}>Import More</Text>
+              </TouchableOpacity>
+            </View>
+          ) : null
+        }
+      />
 
       <ApiKeyModal
         visible={apiKeyModalVisible}
         onClose={() => setApiKeyModalVisible(false)}
-        onKeySaved={() => {
-          if (imageUri) processImageWithAI(imageUri);
-        }}
+        onKeySaved={() => {}}
       />
-    </ScrollView>
+    </View>
   );
 }
 
+// ─── Styles ─────────────────────────────────────────────────────────────────────
+
 const styles = StyleSheet.create({
-  scroll: {
-    flex: 1,
+  fill: { flex: 1, backgroundColor: colors.background },
+  scroll: { flex: 1, backgroundColor: colors.background },
+  container: { paddingHorizontal: 20, paddingTop: 54, paddingBottom: 60 },
+
+  header: { marginBottom: 20 },
+  stickyHeader: {
     backgroundColor: colors.background,
-  },
-  container: {
     paddingHorizontal: 20,
     paddingTop: 54,
-    paddingBottom: 40,
-  },
-
-  /* Header */
-  header: {
-    marginBottom: 20,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
   },
   headerTop: {
     flexDirection: 'row',
@@ -358,37 +441,9 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.limeBorder,
   },
-  keyBtnText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: colors.primaryDark,
-  },
-  headerSub: {
-    fontSize: 13,
-    color: colors.textSecondary,
-    marginTop: 4,
-    lineHeight: 18,
-  },
-  keyWarningBanner: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    backgroundColor: colors.warningBg,
-    paddingVertical: 9,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#FDE68A',
-  },
-  keyWarningText: {
-    flex: 1,
-    fontSize: 12,
-    color: '#92400E',
-    lineHeight: 16,
-    fontWeight: '500',
-  },
+  keyBtnText: { fontSize: 12, fontWeight: '700', color: colors.primaryDark },
+  headerSub: { fontSize: 13, color: colors.textSecondary, marginTop: 4, lineHeight: 18 },
 
-  /* Drop Zone */
   dropZone: {
     borderWidth: 2,
     borderColor: colors.limeBorder,
@@ -412,16 +467,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.limeBorder,
   },
-  dropTitle: {
-    fontSize: 17,
-    fontWeight: '600',
-    color: colors.text,
-    marginBottom: 6,
-  },
+  dropTitle: { fontSize: 17, fontWeight: '600', color: colors.text, marginBottom: 6 },
   dropSub: {
     fontSize: 13,
     color: colors.textMuted,
     marginBottom: 20,
+    textAlign: 'center',
   },
   selectBtn: {
     flexDirection: 'row',
@@ -429,7 +480,7 @@ const styles = StyleSheet.create({
     gap: 8,
     backgroundColor: colors.primary,
     paddingVertical: 12,
-    paddingHorizontal: 22,
+    paddingHorizontal: 24,
     borderRadius: 12,
     shadowColor: colors.primary,
     shadowOffset: { width: 0, height: 2 },
@@ -437,199 +488,123 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
     elevation: 3,
   },
-  selectBtnText: {
-    color: '#FFFFFF',
-    fontWeight: '600',
-    fontSize: 14,
-  },
+  selectBtnText: { color: '#FFFFFF', fontWeight: '600', fontSize: 14 },
 
-  /* Active Content */
-  activeContent: {
-    gap: 16,
-  },
-  previewCard: {
-    position: 'relative',
-    borderRadius: 16,
-    overflow: 'hidden',
-    backgroundColor: colors.surfaceSubtle,
-    borderWidth: 1,
-    borderColor: colors.cardBorder,
-  },
-  previewImage: {
-    width: '100%',
-    height: 240,
-  },
-  analyzingOverlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(255, 255, 255, 0.85)',
+  hints: { marginTop: 28, gap: 12 },
+  hintRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  hintIconBox: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    backgroundColor: colors.limeLight,
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  analyzingBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    backgroundColor: colors.card,
-    paddingVertical: 12,
-    paddingHorizontal: 18,
-    borderRadius: 24,
     borderWidth: 1,
     borderColor: colors.limeBorder,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.08,
-    shadowRadius: 6,
-    elevation: 4,
   },
-  analyzingText: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: colors.primaryDark,
-  },
+  hintText: { fontSize: 13, color: colors.textSecondary, flex: 1 },
 
-  /* Result Card */
-  resultCard: {
-    backgroundColor: colors.card,
-    borderRadius: 16,
-    padding: 18,
-    borderWidth: 1,
-    borderColor: colors.cardBorder,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.04,
-    shadowRadius: 6,
-    elevation: 2,
-    gap: 14,
+  progressBarTrack: {
+    height: 6,
+    backgroundColor: colors.surfaceAlt,
+    borderRadius: 3,
+    marginTop: 10,
+    overflow: 'hidden',
   },
-  successBanner: {
+  progressBarFill: { height: '100%', backgroundColor: colors.primary, borderRadius: 3 },
+  statsRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 8 },
+  statChip: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 4,
     backgroundColor: colors.limeLight,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 8,
+    paddingVertical: 3,
+    paddingHorizontal: 8,
+    borderRadius: 6,
     borderWidth: 1,
     borderColor: colors.limeBorder,
   },
-  successBannerText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: colors.limeDark,
-  },
+  statChipError: { backgroundColor: colors.errorBg, borderColor: colors.errorBorder },
+  statText: { fontSize: 12, fontWeight: '600', color: colors.limeDark },
+  statTotal: { marginLeft: 'auto', fontSize: 12, color: colors.textMuted, fontWeight: '500' },
 
-  detectedCategoryRow: {
-    gap: 6,
+  summarySection: {
+    paddingHorizontal: 20,
+    paddingVertical: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
   },
-  sectionLabel: {
-    fontSize: 11,
+  summaryTitle: {
+    fontSize: 12,
     fontWeight: '700',
     color: colors.textMuted,
     letterSpacing: 0.5,
     textTransform: 'uppercase',
+    marginBottom: 10,
   },
-  categoryPill: {
-    flexDirection: 'row',
+  summaryGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  summaryCard: {
     alignItems: 'center',
-    alignSelf: 'flex-start',
-    gap: 6,
     backgroundColor: colors.limeLight,
     borderWidth: 1,
     borderColor: colors.limeBorder,
-    paddingVertical: 6,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-  },
-  categoryPillText: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: colors.limeDark,
-  },
-
-  infoSection: {
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
     gap: 4,
+    minWidth: 80,
   },
-  intentText: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: colors.text,
-    lineHeight: 20,
-  },
-  summaryText: {
-    fontSize: 13,
-    color: colors.textSecondary,
-    lineHeight: 18,
-  },
-  tagsContainer: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-    marginTop: 2,
-  },
-  tagBadge: {
-    backgroundColor: colors.surfaceAlt,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 6,
-  },
-  tagBadgeText: {
+  summaryCount: { fontSize: 18, fontWeight: '800', color: colors.limeDark },
+  summaryLabel: {
     fontSize: 11,
-    color: colors.textSecondary,
-    fontWeight: '500',
-  },
-
-  /* Category Override */
-  changeCategoryToggle: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    paddingVertical: 4,
-  },
-  changeCategoryToggleText: {
-    fontSize: 12,
-    color: colors.textSecondary,
-    fontWeight: '500',
-  },
-  categoryList: {
-    gap: 6,
-    backgroundColor: colors.surface,
-    padding: 10,
-    borderRadius: 12,
-  },
-  catOption: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    borderRadius: 8,
-  },
-  catOptionActive: {
-    backgroundColor: colors.limeLight,
-  },
-  catOptionText: {
-    fontSize: 13,
-    color: colors.textSecondary,
-    flex: 1,
-  },
-  catOptionTextActive: {
-    color: colors.limeDark,
     fontWeight: '600',
-  },
-  checkIcon: {
-    marginLeft: 'auto',
+    color: colors.primaryDark,
+    textAlign: 'center',
   },
 
-  /* Action Buttons */
-  actionButtons: {
+  listContent: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 20, gap: 10 },
+
+  itemRow: {
     flexDirection: 'row',
-    gap: 10,
-    marginTop: 6,
+    alignItems: 'center',
+    backgroundColor: colors.card,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: colors.cardBorder,
+    padding: 12,
+    gap: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.03,
+    shadowRadius: 4,
+    elevation: 1,
   },
+  itemThumb: { width: 54, height: 54, borderRadius: 8, backgroundColor: colors.surfaceAlt },
+  itemInfo: { flex: 1, gap: 4 },
+  itemStatusPending: { fontSize: 13, color: colors.textMuted, fontStyle: 'italic' },
+  itemAnalyzingRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  itemStatusAnalyzing: { fontSize: 13, color: colors.primary, fontWeight: '500' },
+  itemCatPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: colors.limeLight,
+    alignSelf: 'flex-start',
+    paddingVertical: 2,
+    paddingHorizontal: 7,
+    borderRadius: 5,
+    borderWidth: 1,
+    borderColor: colors.limeBorder,
+  },
+  itemCatText: { fontSize: 11, fontWeight: '700', color: colors.limeDark },
+  itemIntent: { fontSize: 13, color: colors.text, fontWeight: '500', lineHeight: 17 },
+  geminiChip: { flexDirection: 'row', alignItems: 'center', gap: 3, alignSelf: 'flex-start' },
+  geminiChipText: { fontSize: 10, color: colors.primary, fontWeight: '600' },
+  itemErrorRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  itemErrorText: { fontSize: 13, color: colors.error, fontWeight: '500' },
+  itemStatusIcon: { width: 24, alignItems: 'center' },
+
+  footer: { flexDirection: 'row', gap: 10, marginTop: 16 },
   primaryActionBtn: {
     flex: 1,
     flexDirection: 'row',
@@ -637,14 +612,15 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: 8,
     backgroundColor: colors.primary,
-    paddingVertical: 12,
+    paddingVertical: 13,
     borderRadius: 12,
+    shadowColor: colors.primary,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 4,
+    elevation: 2,
   },
-  primaryActionBtnText: {
-    color: '#FFFFFF',
-    fontWeight: '600',
-    fontSize: 14,
-  },
+  primaryActionBtnText: { color: '#FFFFFF', fontWeight: '600', fontSize: 14 },
   secondaryActionBtn: {
     flex: 1,
     flexDirection: 'row',
@@ -654,22 +630,8 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surface,
     borderWidth: 1,
     borderColor: colors.limeBorder,
-    paddingVertical: 12,
+    paddingVertical: 13,
     borderRadius: 12,
   },
-  secondaryActionBtnText: {
-    color: colors.primaryDark,
-    fontWeight: '600',
-    fontSize: 13,
-  },
-
-  repickBtn: {
-    paddingVertical: 12,
-    alignItems: 'center',
-  },
-  repickBtnText: {
-    fontSize: 13,
-    color: colors.textSecondary,
-    textDecorationLine: 'underline',
-  },
+  secondaryActionBtnText: { color: colors.primaryDark, fontWeight: '600', fontSize: 13 },
 });
