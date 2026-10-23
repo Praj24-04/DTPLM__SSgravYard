@@ -1,14 +1,5 @@
 # ss_graveyard 🪦 ➔ ⚡
 
-```
-  ___ ___     ___                            _ 
- / __/ __|   / __|_ _ __ ___ _____ _  _ __ _ _ _ __| |
- \__ \__ \  | (_ | '_/ _` \ V / -_) || / _` | '_/ _` |
- |___/___/   \___|_| \__,_|\_/\___|\_, \__,_|_| \__,_|
-                                   |__/                
-  >> SYSTEM STATUS: ONLINE | MULTIMODAL INGESTION ACTIVE
-```
-
 > **Your camera roll is where good intentions go to die. We’re the necromancers.**
 > An AI-powered screenshot intelligence engine that takes 50 forgotten screenshots, analyzes them in parallel with Gemini Vision, extracts their real intent, and turns visual noise into a searchable second brain.
 
@@ -22,7 +13,7 @@
 
 ---
 
-## ⚡ The Confession
+## The Confession!!!
 
 Let’s be honest with each other: you have at least 1,200 screenshots on your phone right now. 
 
@@ -136,24 +127,6 @@ No need to re-bundle or mess with `.env` files if you don't want to.
 Prefer `.env`? Just throw this in your root:
 ```bash
 EXPO_PUBLIC_GEMINI_API_KEY="AIzaSyYourKeyHere"
-```
-
----
-
-## 📦 Tech Stack Directory
-
-```
-├── src/
-│   ├── app/
-│   │   ├── _layout.tsx      # File-based navigation & custom tab bar
-│   │   ├── index.tsx        # Vault Feed: Category chips, stats & card views
-│   │   ├── upload.tsx       # Bulk ingestion: 3-worker concurrent batch queue
-│   │   ├── search.tsx       # Real-time multi-attribute search index
-│   │   └── detail.tsx       # Fullscreen asset dossier, tag inspector & editor
-│   ├── ai.ts                # Downsampler + Gemini Flash prompt pipeline
-│   ├── constants.ts         # Handshake endpoints, key storage & health checks
-│   ├── storage.ts           # Persistent AsyncStorage CRUD & sample seeder
-│   └── theme.ts             # Forest/Lime design tokens & category ontology
 ```
 
 ---
